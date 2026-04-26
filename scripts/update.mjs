@@ -51,27 +51,24 @@ async function downloadXlsx(url) {
   return buf;
 }
 
-function parseRegistry(buf) {
-  const wb = XLSX.read(buf, { type: 'buffer' });
-  // В файле ЦБ листы: «Действующие», «Действующие МФК», «Действующие МКК»,
-  // «Исключенные». Берём основной — со всеми действующими.
-  const sheet = wb.Sheets['Действующие'] ?? wb.Sheets[wb.SheetNames[0]];
+// Универсальный поиск ключа: имена колонок длинные, ищем по нескольким
+// подстрокам (логическое AND).
+const findKey = (sample, ...needles) => {
+  for (const k of Object.keys(sample)) {
+    const lk = String(k).toLowerCase();
+    if (needles.every((n) => lk.includes(n))) return k;
+  }
+  return null;
+};
 
-  // Первые 4 строки — текстовая шапка документа («Государственный реестр…»),
-  // настоящие имена колонок начинаются на строке 5 (range: 4 в zero-indexed).
+// Парсит один лист реестра в нормализованный массив записей.
+// Шапка документа на разных листах разной высоты, поэтому headerOffset.
+function parseSheet(sheet, headerOffset, opts = {}) {
+  if (!sheet) return [];
   const rows = XLSX.utils.sheet_to_json(sheet, {
-    defval: null, raw: false, range: 4,
+    defval: null, raw: false, range: headerOffset,
   });
   if (rows.length === 0) return [];
-
-  // Имена колонок длинные — ищем по нескольким вхождениям (AND).
-  const findKey = (sample, ...needles) => {
-    for (const k of Object.keys(sample)) {
-      const lk = String(k).toLowerCase();
-      if (needles.every((n) => lk.includes(n))) return k;
-    }
-    return null;
-  };
 
   const s = rows[0];
   const keyName    = findKey(s, 'полное', 'наимен');
@@ -79,8 +76,10 @@ function parseRegistry(buf) {
   const keyInn     = findKey(s, 'идентификационный') ?? findKey(s, 'инн');
   const keyOgrn    = findKey(s, 'огрн') ?? findKey(s, 'основной', 'регистрац');
   const keyReg     = findKey(s, 'регистрационный', 'номер', 'записи');
-  const keyAddress = findKey(s, 'адрес', 'юридическ')
-    ?? findKey(s, 'адрес');
+  const keyAddress = findKey(s, 'адрес', 'юридическ') ?? findKey(s, 'адрес');
+  const keyExclusion = opts.withExclusionDate
+    ? findKey(s, 'исключени') ?? findKey(s, 'исключения')
+    : null;
 
   return rows
     .map((r) => ({
@@ -90,8 +89,28 @@ function parseRegistry(buf) {
       ogrn: keyOgrn ? String(r[keyOgrn] ?? '').replace(/\D+/g, '') || undefined : undefined,
       registryRecordNo: keyReg ? String(r[keyReg] ?? '').trim() || undefined : undefined,
       address: keyAddress ? String(r[keyAddress] ?? '').trim() || undefined : undefined,
+      exclusionDate: keyExclusion ? String(r[keyExclusion] ?? '').trim() || undefined : undefined,
     }))
     .filter((r) => r.name && r.inn.length === 10);
+}
+
+// Парсит обе вкладки и возвращает нормализованные списки.
+//   active   — лист «Действующие» (шапка 4 строки)
+//   excluded — лист «Исключенные» (шапка 2 строки + колонка с датой
+//              исключения; используется для уточнения статуса записей,
+//              которые уже есть в нашем каталоге)
+function parseRegistry(buf) {
+  const wb = XLSX.read(buf, { type: 'buffer' });
+  const active = parseSheet(
+    wb.Sheets['Действующие'] ?? wb.Sheets[wb.SheetNames[0]],
+    4,
+  );
+  const excluded = parseSheet(
+    wb.Sheets['Исключенные'],
+    2,
+    { withExclusionDate: true },
+  );
+  return { active, excluded };
 }
 
 async function readCurrent() {
@@ -101,21 +120,23 @@ async function readCurrent() {
 
 function merge(current, fromRegistry) {
   const byInn = new Map(current.creditors.map((c) => [c.inn, c]));
-  const seen = new Set();
+  const activeInns = new Set();
   const now = todayIso();
+  const { active, excluded } = fromRegistry;
 
-  for (const r of fromRegistry) {
-    seen.add(r.inn);
+  // 1) Действующие — создаём новые записи или обновляем существующие
+  for (const r of active) {
+    activeInns.add(r.inn);
     const existing = byInn.get(r.inn);
     if (existing) {
-      // Обновляем поля, которые приходят из реестра ЦБ; остальные оставляем
       existing.licenseStatus = 'active';
       existing.registryRecordNo = r.registryRecordNo ?? existing.registryRecordNo;
       existing.ogrn = r.ogrn ?? existing.ogrn;
       existing.address = r.address ?? existing.address;
+      // Если МФО была revoked, а теперь снова в реестре — снимаем дату исключения
+      delete existing.revokedAt;
       existing.updatedAt = now;
     } else {
-      // Новая запись — добавляем с дефолтным рейтингом
       byInn.set(r.inn, {
         inn: r.inn,
         name: r.name,
@@ -133,11 +154,25 @@ function merge(current, fromRegistry) {
     }
   }
 
-  // Те, кого нет в реестре, но они есть у нас — помечаем revoked.
-  // Кроме записи-плейсхолдера (inn 0000000000) — она не из реестра.
+  // 2) Исключенные — обновляем статус ТОЛЬКО для тех ИНН, что уже есть
+  // у нас в каталоге. Список исключённых на стороне ЦБ огромный (~9к),
+  // целиком грузить нет смысла: пользователь не увидит этих МФО при
+  // добавлении займа, но если у него уже есть займ от такой МФО, статус
+  // подтянется в следующий цикл синхронизации.
+  const excludedByInn = new Map(excluded.map((r) => [r.inn, r]));
   for (const c of byInn.values()) {
-    if (c.inn === '0000000000') continue;
-    if (!seen.has(c.inn) && c.licenseStatus === 'active') {
+    if (c.inn === '0000000000') continue;            // плейсхолдер
+    if (activeInns.has(c.inn)) continue;             // в реестре действующих
+    const ex = excludedByInn.get(c.inn);
+    if (ex) {
+      // Точное совпадение — есть в реестре исключённых, можем добавить
+      // дату исключения для UI приложения.
+      c.licenseStatus = 'revoked';
+      c.revokedAt = ex.exclusionDate ?? c.revokedAt;
+      c.updatedAt = now;
+    } else if (c.licenseStatus === 'active') {
+      // На всякий случай: МФО исчезла из обоих списков (теоретически
+      // не должно быть). Помечаем revoked без даты, как раньше.
       c.licenseStatus = 'revoked';
       c.updatedAt = now;
     }
@@ -172,7 +207,15 @@ async function main() {
 
   const buf = await downloadXlsx(CBR_URL);
   const fromReg = parseRegistry(buf);
-  console.log(`→ В реестре ЦБ найдено ${fromReg.length} организаций`);
+  console.log(`→ В реестре ЦБ:`);
+  console.log(`    действующих:  ${fromReg.active.length}`);
+  console.log(`    исключённых:  ${fromReg.excluded.length} (используются для уточнения статуса)`);
+
+  const before = {
+    total: current.creditors.length,
+    active: current.creditors.filter((c) => c.licenseStatus === 'active').length,
+    revoked: current.creditors.filter((c) => c.licenseStatus === 'revoked').length,
+  };
 
   const next = merge(current, fromReg);
 
@@ -182,17 +225,19 @@ async function main() {
     'utf-8',
   );
 
-  const added = next.creditors.length - current.creditors.length;
-  const revoked = next.creditors.filter((c) => c.licenseStatus === 'revoked').length
-                - current.creditors.filter((c) => c.licenseStatus === 'revoked').length;
+  const after = {
+    total: next.creditors.length,
+    active: next.creditors.filter((c) => c.licenseStatus === 'active').length,
+    revoked: next.creditors.filter((c) => c.licenseStatus === 'revoked').length,
+  };
+
   console.log('✓ Каталог обновлён');
   console.log(`  Версия: ${next.version}`);
-  console.log(`  Всего записей: ${next.creditors.length}`);
-  console.log(`  Добавлено новых: ${added}`);
-  console.log(`  Помечено отозванными: ${revoked}`);
+  console.log(`  Всего записей: ${after.total} (${after.total - before.total} новых)`);
+  console.log(`    действующих:  ${after.active} (было ${before.active})`);
+  console.log(`    отозванных:   ${after.revoked} (было ${before.revoked})`);
   console.log('');
-  console.log('Не забудьте: проверить diff, отредактировать ratingScore у новых записей,');
-  console.log('закоммитить creditors.json и обновить хостинг.');
+  console.log('Готово к коммиту.');
 }
 
 main().catch((e) => {
