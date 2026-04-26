@@ -34,7 +34,7 @@ const CATALOG_PATH = path.join(__dirname, '..', 'creditors.json');
 
 // ЦБ РФ публикует реестр МФО как Excel. URL может меняться — проверяйте
 // актуальный на https://www.cbr.ru/microfinance/registry/
-const CBR_URL = 'https://www.cbr.ru/finmarket/files/supervision/list_MFO.xlsx';
+const CBR_URL = 'https://www.cbr.ru/vfs/finmarkets/files/supervision/list_MFO.xlsx';
 
 const todayIso = () => new Date().toISOString();
 const todayVersion = () => {
@@ -53,38 +53,42 @@ async function downloadXlsx(url) {
 
 function parseRegistry(buf) {
   const wb = XLSX.read(buf, { type: 'buffer' });
-  const sheet = wb.Sheets[wb.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json(sheet, { defval: null, raw: false });
+  // В файле ЦБ листы: «Действующие», «Действующие МФК», «Действующие МКК»,
+  // «Исключенные». Берём основной — со всеми действующими.
+  const sheet = wb.Sheets['Действующие'] ?? wb.Sheets[wb.SheetNames[0]];
 
-  // Структура файла ЦБ нестабильна между релизами — нормализуем по нескольким
-  // возможным названиям колонок. Перед запуском проверьте sheet_to_json вывод.
-  const norm = (s) => String(s ?? '').toLowerCase().trim();
-  const findKey = (sample, needles) => {
+  // Первые 4 строки — текстовая шапка документа («Государственный реестр…»),
+  // настоящие имена колонок начинаются на строке 5 (range: 4 в zero-indexed).
+  const rows = XLSX.utils.sheet_to_json(sheet, {
+    defval: null, raw: false, range: 4,
+  });
+  if (rows.length === 0) return [];
+
+  // Имена колонок длинные — ищем по нескольким вхождениям (AND).
+  const findKey = (sample, ...needles) => {
     for (const k of Object.keys(sample)) {
-      const lk = norm(k);
-      if (needles.some((n) => lk.includes(n))) return k;
+      const lk = String(k).toLowerCase();
+      if (needles.every((n) => lk.includes(n))) return k;
     }
     return null;
   };
 
-  if (rows.length === 0) return [];
-  const sample = rows[0];
-  const keyName = findKey(sample, ['наименован']);          // полное наименование
-  const keyShort = findKey(sample, ['сокращ']);             // сокращённое
-  const keyInn = findKey(sample, ['инн']);
-  const keyOgrn = findKey(sample, ['огрн']);
-  const keyReg = findKey(sample, ['реестр', 'регистрац']);  // рег. номер записи
-  const keyDate = findKey(sample, ['дата внес']);
-  const keyAddress = findKey(sample, ['адрес']);
+  const s = rows[0];
+  const keyName    = findKey(s, 'полное', 'наимен');
+  const keyShort   = findKey(s, 'сокращ', 'наимен');
+  const keyInn     = findKey(s, 'идентификационный') ?? findKey(s, 'инн');
+  const keyOgrn    = findKey(s, 'огрн') ?? findKey(s, 'основной', 'регистрац');
+  const keyReg     = findKey(s, 'регистрационный', 'номер', 'записи');
+  const keyAddress = findKey(s, 'адрес', 'юридическ')
+    ?? findKey(s, 'адрес');
 
   return rows
     .map((r) => ({
-      name: String(r[keyName] ?? '').trim(),
+      name: keyName ? String(r[keyName] ?? '').trim() : '',
       shortName: keyShort ? String(r[keyShort] ?? '').trim() || undefined : undefined,
       inn: keyInn ? String(r[keyInn] ?? '').replace(/\D+/g, '') : '',
       ogrn: keyOgrn ? String(r[keyOgrn] ?? '').replace(/\D+/g, '') || undefined : undefined,
       registryRecordNo: keyReg ? String(r[keyReg] ?? '').trim() || undefined : undefined,
-      registryDate: keyDate ? String(r[keyDate] ?? '').trim() || undefined : undefined,
       address: keyAddress ? String(r[keyAddress] ?? '').trim() || undefined : undefined,
     }))
     .filter((r) => r.name && r.inn.length === 10);
@@ -139,8 +143,21 @@ function merge(current, fromRegistry) {
     }
   }
 
+  // Версия = сегодняшняя дата UTC. Если она совпадает с уже опубликованной
+  // (повторный запуск за день) — добавляем суффикс `.N`, чтобы клиенты
+  // увидели изменение и подтянули новый JSON.
+  const today = todayVersion();
+  let nextVersion = today;
+  if (current.version === today) {
+    nextVersion = `${today}.1`;
+  } else if (current.version.startsWith(`${today}.`)) {
+    const m = /\.(\d+)$/.exec(current.version);
+    const n = m ? Number(m[1]) + 1 : 1;
+    nextVersion = `${today}.${n}`;
+  }
+
   return {
-    version: todayVersion(),
+    version: nextVersion,
     updatedAt: now,
     source: current.source,
     notes: current.notes,
