@@ -1,9 +1,10 @@
 {
-  "name": "dinosaurus-catalog",
+  "name": "catalog-mfo",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Каталог МФО для приложения Dinosaurus",
+  "description": "JSON-справочник МФО из реестра ЦБ РФ",
+  "license": "MIT",
   "scripts": {
     "update": "node scripts/update.mjs"
   },

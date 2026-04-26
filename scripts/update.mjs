@@ -2,20 +2,18 @@
 // Обновление каталога МФО из реестра ЦБ РФ.
 //
 // Скачивает Excel-файл реестра МФО с сайта ЦБ, парсит и сливает с
-// существующим catalog/creditors.json:
+// существующим creditors.json:
 //   - Обновляет статус лицензии (active/suspended/revoked) и регистрационный
 //     номер для записей, которые уже есть в каталоге (по ИНН).
 //   - Добавляет новые записи как `licenseStatus: 'active'` с дефолтным
-//     ratingScore=50 (потом редактируйте вручную).
+//     ratingScore=50.
 //   - Помечает удалённые из реестра записи как `licenseStatus: 'revoked'`.
 //
 // Запуск:
-//   cd catalog && npm install xlsx
-//   node scripts/update.mjs
+//   npm install
+//   npm run update
 //
-// После запуска — закоммитить изменённый creditors.json. Если каталог
-// захостен на GitHub Pages, обновление доедет до пользователей при
-// следующем запуске их приложения.
+// После запуска — закоммитить изменённый creditors.json.
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -106,7 +104,7 @@ function merge(current, fromRegistry) {
     seen.add(r.inn);
     const existing = byInn.get(r.inn);
     if (existing) {
-      // Обновляем то, что меняется в реестре, не трогаем редакторские поля
+      // Обновляем поля, которые приходят из реестра ЦБ; остальные оставляем
       existing.licenseStatus = 'active';
       existing.registryRecordNo = r.registryRecordNo ?? existing.registryRecordNo;
       existing.ogrn = r.ogrn ?? existing.ogrn;
@@ -132,7 +130,7 @@ function merge(current, fromRegistry) {
   }
 
   // Те, кого нет в реестре, но они есть у нас — помечаем revoked.
-  // Кроме «Свой кредитор» (inn 0000000000) — он редакторская запись.
+  // Кроме записи-плейсхолдера (inn 0000000000) — она не из реестра.
   for (const c of byInn.values()) {
     if (c.inn === '0000000000') continue;
     if (!seen.has(c.inn) && c.licenseStatus === 'active') {
