@@ -1,0 +1,186 @@
+#!/usr/bin/env node
+// Обновление каталога МФО из реестра ЦБ РФ.
+//
+// Скачивает Excel-файл реестра МФО с сайта ЦБ, парсит и сливает с
+// существующим catalog/creditors.json:
+//   - Обновляет статус лицензии (active/suspended/revoked) и регистрационный
+//     номер для записей, которые уже есть в каталоге (по ИНН).
+//   - Добавляет новые записи как `licenseStatus: 'active'` с дефолтным
+//     ratingScore=50 (потом редактируйте вручную).
+//   - Помечает удалённые из реестра записи как `licenseStatus: 'revoked'`.
+//
+// Запуск:
+//   cd catalog && npm install xlsx
+//   node scripts/update.mjs
+//
+// После запуска — закоммитить изменённый creditors.json. Если каталог
+// захостен на GitHub Pages, обновление доедет до пользователей при
+// следующем запуске их приложения.
+
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// Используем dynamic import, чтобы скрипт не падал, если xlsx не установлен —
+// выводим понятное сообщение.
+let XLSX;
+try {
+  XLSX = (await import('xlsx')).default;
+} catch {
+  console.error('Установите парсер: cd catalog && npm install xlsx');
+  process.exit(1);
+}
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CATALOG_PATH = path.join(__dirname, '..', 'creditors.json');
+
+// ЦБ РФ публикует реестр МФО как Excel. URL может меняться — проверяйте
+// актуальный на https://www.cbr.ru/microfinance/registry/
+const CBR_URL = 'https://www.cbr.ru/finmarket/files/supervision/list_MFO.xlsx';
+
+const todayIso = () => new Date().toISOString();
+const todayVersion = () => {
+  const d = new Date();
+  return `${d.getUTCFullYear()}.${String(d.getUTCMonth() + 1).padStart(2, '0')}.${String(d.getUTCDate()).padStart(2, '0')}`;
+};
+
+async function downloadXlsx(url) {
+  console.log(`→ Скачиваю реестр: ${url}`);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  console.log(`  получено ${buf.length} байт`);
+  return buf;
+}
+
+function parseRegistry(buf) {
+  const wb = XLSX.read(buf, { type: 'buffer' });
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval: null, raw: false });
+
+  // Структура файла ЦБ нестабильна между релизами — нормализуем по нескольким
+  // возможным названиям колонок. Перед запуском проверьте sheet_to_json вывод.
+  const norm = (s) => String(s ?? '').toLowerCase().trim();
+  const findKey = (sample, needles) => {
+    for (const k of Object.keys(sample)) {
+      const lk = norm(k);
+      if (needles.some((n) => lk.includes(n))) return k;
+    }
+    return null;
+  };
+
+  if (rows.length === 0) return [];
+  const sample = rows[0];
+  const keyName = findKey(sample, ['наименован']);          // полное наименование
+  const keyShort = findKey(sample, ['сокращ']);             // сокращённое
+  const keyInn = findKey(sample, ['инн']);
+  const keyOgrn = findKey(sample, ['огрн']);
+  const keyReg = findKey(sample, ['реестр', 'регистрац']);  // рег. номер записи
+  const keyDate = findKey(sample, ['дата внес']);
+  const keyAddress = findKey(sample, ['адрес']);
+
+  return rows
+    .map((r) => ({
+      name: String(r[keyName] ?? '').trim(),
+      shortName: keyShort ? String(r[keyShort] ?? '').trim() || undefined : undefined,
+      inn: keyInn ? String(r[keyInn] ?? '').replace(/\D+/g, '') : '',
+      ogrn: keyOgrn ? String(r[keyOgrn] ?? '').replace(/\D+/g, '') || undefined : undefined,
+      registryRecordNo: keyReg ? String(r[keyReg] ?? '').trim() || undefined : undefined,
+      registryDate: keyDate ? String(r[keyDate] ?? '').trim() || undefined : undefined,
+      address: keyAddress ? String(r[keyAddress] ?? '').trim() || undefined : undefined,
+    }))
+    .filter((r) => r.name && r.inn.length === 10);
+}
+
+async function readCurrent() {
+  const raw = await fs.readFile(CATALOG_PATH, 'utf-8');
+  return JSON.parse(raw);
+}
+
+function merge(current, fromRegistry) {
+  const byInn = new Map(current.creditors.map((c) => [c.inn, c]));
+  const seen = new Set();
+  const now = todayIso();
+
+  for (const r of fromRegistry) {
+    seen.add(r.inn);
+    const existing = byInn.get(r.inn);
+    if (existing) {
+      // Обновляем то, что меняется в реестре, не трогаем редакторские поля
+      existing.licenseStatus = 'active';
+      existing.registryRecordNo = r.registryRecordNo ?? existing.registryRecordNo;
+      existing.ogrn = r.ogrn ?? existing.ogrn;
+      existing.address = r.address ?? existing.address;
+      existing.updatedAt = now;
+    } else {
+      // Новая запись — добавляем с дефолтным рейтингом
+      byInn.set(r.inn, {
+        inn: r.inn,
+        name: r.name,
+        shortName: r.shortName,
+        ogrn: r.ogrn,
+        licenseStatus: 'active',
+        registryRecordNo: r.registryRecordNo,
+        maxProlongations: 5,
+        prolongationFeeRate: 0,
+        ratingScore: 50,
+        address: r.address,
+        complaintsUrl: 'https://www.cbr.ru/Reception/Message/Register',
+        updatedAt: now,
+      });
+    }
+  }
+
+  // Те, кого нет в реестре, но они есть у нас — помечаем revoked.
+  // Кроме «Свой кредитор» (inn 0000000000) — он редакторская запись.
+  for (const c of byInn.values()) {
+    if (c.inn === '0000000000') continue;
+    if (!seen.has(c.inn) && c.licenseStatus === 'active') {
+      c.licenseStatus = 'revoked';
+      c.updatedAt = now;
+    }
+  }
+
+  return {
+    version: todayVersion(),
+    updatedAt: now,
+    source: current.source,
+    notes: current.notes,
+    creditors: Array.from(byInn.values())
+      .sort((a, b) => a.name.localeCompare(b.name, 'ru')),
+  };
+}
+
+async function main() {
+  const current = await readCurrent();
+  console.log(`Текущая версия: ${current.version} (${current.creditors.length} записей)`);
+
+  const buf = await downloadXlsx(CBR_URL);
+  const fromReg = parseRegistry(buf);
+  console.log(`→ В реестре ЦБ найдено ${fromReg.length} организаций`);
+
+  const next = merge(current, fromReg);
+
+  await fs.writeFile(
+    CATALOG_PATH,
+    JSON.stringify(next, null, 2) + '\n',
+    'utf-8',
+  );
+
+  const added = next.creditors.length - current.creditors.length;
+  const revoked = next.creditors.filter((c) => c.licenseStatus === 'revoked').length
+                - current.creditors.filter((c) => c.licenseStatus === 'revoked').length;
+  console.log('✓ Каталог обновлён');
+  console.log(`  Версия: ${next.version}`);
+  console.log(`  Всего записей: ${next.creditors.length}`);
+  console.log(`  Добавлено новых: ${added}`);
+  console.log(`  Помечено отозванными: ${revoked}`);
+  console.log('');
+  console.log('Не забудьте: проверить diff, отредактировать ratingScore у новых записей,');
+  console.log('закоммитить creditors.json и обновить хостинг.');
+}
+
+main().catch((e) => {
+  console.error('✗ Ошибка:', e.message ?? e);
+  process.exit(1);
+});

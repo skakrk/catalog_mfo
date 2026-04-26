@@ -1,0 +1,13 @@
+{
+  "name": "dinosaurus-catalog",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Каталог МФО для приложения Dinosaurus",
+  "scripts": {
+    "update": "node scripts/update.mjs"
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  }
+}
